@@ -945,7 +945,24 @@ class ImagePosterize:
 
         return(image,)
 
-# From https://github.com/yoonsikp/pycubelut/blob/master/pycubelut.py (MIT license)
+# lut 批量处理 GPU处理
+# 使用 TorchScript 优化数学链条
+@torch.jit.script
+def fused_math_operations(working, gamma: bool, is_non_default: bool, dom_min, dom_scale):
+    # 将所有非 grid_sample 的数学运算合并
+    if gamma:
+        working = torch.clamp(working, min=1e-9).pow(1.0/2.2)
+    
+    # 构造采样网格 (RGB -> BGR 对应 LUT 索引)
+    r = working[..., 0:1]
+    g = working[..., 1:2]
+    b = working[..., 2:3]
+    grid = torch.cat([b, g, r], dim=-1).unsqueeze(1)
+    grid = grid * 2.0 - 1.0
+    return grid
+
+_LUT_CACHE = {}
+
 class ImageApplyLUT:
     @classmethod
     def INPUT_TYPES(s):
@@ -957,60 +974,71 @@ class ImageApplyLUT:
                 "clip_values": ("BOOLEAN", { "default": True }),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.1 }),
             }}
-
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "execute"
     CATEGORY = "essentials/image processing"
 
-    # TODO: check if we can do without numpy
     def execute(self, image, lut_file, gamma_correction, clip_values, strength):
-        lut_file_path = folder_paths.get_full_path("luts", lut_file)
-        if not lut_file_path or not Path(lut_file_path).exists():
-            print(f"Could not find LUT file: {lut_file_path}")
-            return (image,)
-            
-        from colour.io.luts.iridas_cube import read_LUT_IridasCube
-        
+        # 1. 设备与精度自动判定
         device = image.device
-        lut = read_LUT_IridasCube(lut_file_path)
-        lut.name = lut_file
+        
+        # 核心修复：只有在 CUDA 上才允许使用半精度
+        if device.type == 'cuda':
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            dtype = torch.float32 # CPU 环境强制使用 FP32
+            
+        batch_size = image.shape[0]
 
-        if clip_values:
-            if lut.domain[0].max() == lut.domain[0].min() and lut.domain[1].max() == lut.domain[1].min():
-                lut.table = np.clip(lut.table, lut.domain[0, 0], lut.domain[1, 0])
+        # 2. LUT 加载与缓存（增加设备检查）
+        lut_key = f"{lut_file}_{clip_values}_{dtype}_{device}"
+        if lut_key in _LUT_CACHE:
+            lut_tensor, dom_min, dom_scale, is_non_default = _LUT_CACHE[lut_key]
+        else:
+            lut_file_path = folder_paths.get_full_path("luts", lut_file)
+            from colour.io.luts.iridas_cube import read_LUT_IridasCube
+            import numpy as np
+            lut = read_LUT_IridasCube(lut_file_path)
+            table = lut.table.astype(np.float32)
+            if clip_values:
+                table = np.clip(table, lut.domain[0], lut.domain[1])
+            
+            is_non_default = not np.array_equal(lut.domain, np.array([[0., 0., 0.], [1., 1., 1.]]))
+            dom_min = torch.from_numpy(lut.domain[0]).to(device, dtype=dtype)
+            dom_scale = torch.from_numpy(lut.domain[1] - lut.domain[0]).to(device, dtype=dtype)
+            
+            # 统一转为 5D LUT
+            if table.ndim == 4:
+                lut_tensor = torch.from_numpy(table).to(device, dtype=dtype).permute(3, 0, 1, 2).unsqueeze(0)
             else:
-                if len(lut.table.shape) == 2:  # 3x1D
-                    for dim in range(3):
-                        lut.table[:, dim] = np.clip(lut.table[:, dim], lut.domain[0, dim], lut.domain[1, dim])
-                else:  # 3D
-                    for dim in range(3):
-                        lut.table[:, :, :, dim] = np.clip(lut.table[:, :, :, dim], lut.domain[0, dim], lut.domain[1, dim])
+                lut_tensor = torch.from_numpy(table).to(device, dtype=dtype).t().reshape(1, 3, -1, 1, 1)
 
-        out = []
-        for img in image: # TODO: is this more resource efficient? should we use a batch instead?
-            lut_img = img.cpu().numpy().copy()
+            _LUT_CACHE[lut_key] = (lut_tensor, dom_min, dom_scale, is_non_default)
 
-            is_non_default_domain = not np.array_equal(lut.domain, np.array([[0., 0., 0.], [1., 1., 1.]]))
-            dom_scale = None
-            if is_non_default_domain:
-                dom_scale = lut.domain[1] - lut.domain[0]
-                lut_img = lut_img * dom_scale + lut.domain[0]
-            if gamma_correction:
-                lut_img = lut_img ** (1/2.2)
-            lut_img = lut.apply(lut_img)
-            if gamma_correction:
-                lut_img = lut_img ** (2.2)
-            if is_non_default_domain:
-                lut_img = (lut_img - lut.domain[0]) / dom_scale
+        # 3. 执行计算
+        # 确保图像精度正确
+        working = image.to(dtype)
 
-            lut_img = torch.from_numpy(lut_img).to(device)
-            if strength < 1.0:
-                lut_img = strength * lut_img + (1 - strength) * img
-            out.append(lut_img)
+        # 使用 JIT 优化的前处理（合并了 Gamma 和 Grid 构造）
+        grid = fused_math_operations(working, gamma_correction, is_non_default, dom_min, dom_scale)
 
-        out = torch.stack(out)
+        # grid_sample 必须单独调用，因为它是 JIT 难以完全优化的外部算子
+        processed = F.grid_sample(lut_tensor.expand(batch_size, -1, -1, -1, -1), 
+                                grid, mode='bilinear', padding_mode='border', align_corners=True)
+        
+        # 后处理
+        processed = processed.squeeze(2).permute(0, 2, 3, 1)
 
-        return (out, )
+        if gamma_correction:
+            processed = torch.clamp(processed, min=1e-9).pow(2.2)
+
+        if is_non_default:
+            processed = (processed - dom_min) / dom_scale
+
+        if strength < 1.0:
+            processed = torch.lerp(image.to(dtype), processed, strength)
+
+        return (processed.to(image.dtype).clamp(0.0, 1.0),)
 
 # From https://github.com/Jamy-L/Pytorch-Contrast-Adaptive-Sharpening/
 class ImageCAS:
